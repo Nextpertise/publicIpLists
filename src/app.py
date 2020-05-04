@@ -35,8 +35,10 @@ def format(cidr_list):
 @app.route('/<provider>/<ipv>', methods=['GET'])
 def provider(provider, ipv):
     providerObj = providers()
-    if 'provider_{}'.format(provider) in dir(providerObj):
-        return format(providerObj.provider_atlassian(ipv))
+    provider_name = 'provider_{}'.format(provider)
+    if provider_name in dir(providerObj):
+        provider_method = getattr(providerObj, provider_name)
+        return format(provider_method(ipv))
     else:
         abort(404)
 
