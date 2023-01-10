@@ -14,7 +14,6 @@ steps:
     registry: registry.nextpertise.tools
     dockerfile: Dockerfile
     pull_image: true
-    context: src
     username:
       from_secret: platform_harbor_username
     password:
