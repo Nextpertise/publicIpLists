@@ -1,0 +1,248 @@
+---
+name: docker_image_building
+kind: pipeline
+type: docker
+
+steps:
+- name: create docker image public-ip-lists:${DRONE_SOURCE_BRANCH/\/#/-}
+  image: registry.nextpertise.tools/nextpertise-proxy/plugins/docker
+  depends_on:
+    - clone
+  privileged: true
+  settings:
+    repo: registry.nextpertise.tools/nextpertise/public-ip-lists
+    registry: registry.nextpertise.tools
+    dockerfile: Dockerfile
+    pull_image: true
+    context: src
+    username:
+      from_secret: platform_harbor_username
+    password:
+      from_secret: platform_harbor_password
+    tags:
+      - latest
+      - ${DRONE_COMMIT_SHA:0:8}
+
+trigger:
+  event:
+    exclude:
+    - pull_request
+  target:
+    exclude:
+    - production
+
+image_pull_secrets:
+  - platform_harbor_pull_secrets
+
+---
+name: deploy_to_development
+kind: pipeline
+
+steps:
+
+# Deploy development
+- name: set test environment
+  image: registry.nextpertise.tools/nextpertise-proxy/objectiflibre/jinja-init
+  user: 0
+  environment:
+    JINJA_SRC_FILE: 'k8s/template.j2'
+    JINJA_DEST_FILE: '/config/development.yaml'
+    JINJA_VAR_branchtag: ${DRONE_SOURCE_BRANCH/\/#/-}
+    JINJA_VAR_commithash: ${DRONE_COMMIT_SHA:0:8}
+    JINJA_VAR_harborsecret:
+      from_secret: rke_harbor_token
+    JINJA_VAR_imagetag: ${DRONE_COMMIT_SHA:0:8}
+    JINJA_VAR_namespace: public-ip-lists-${DRONE_SOURCE_BRANCH/\/#/-}
+    JINJA_VAR_ingressurl: public-ip-lists-${DRONE_SOURCE_BRANCH/\/#/-}.k8s.nextpertise.nl
+  volumes:
+  - name: configs
+    path: /config
+  commands:
+  - python /run.py
+  - cat /config/development.yaml
+
+- name: deploy to test
+  image: registry.nextpertise.tools/nextpertise-proxy/sinlead/drone-kubectl
+  depends_on:
+    - set test environment
+  volumes:
+  - name: configs
+    path: /config
+  settings:
+    kubernetes_server:
+      from_secret: rke_test_server
+    kubernetes_cert:
+      from_secret: rke_test_cert
+    kubernetes_token:
+      from_secret: rke_test_token
+  commands:
+    - kubectl --insecure-skip-tls-verify=true apply -f /config/development.yaml
+
+trigger:
+  event:
+    exclude:
+    - pull_request
+  target:
+    exclude:
+    - production
+
+depends_on:
+- docker_image_building
+
+volumes:
+- name: configs
+  temp: {}
+
+image_pull_secrets:
+  - platform_harbor_pull_secrets
+
+---
+name: deploy_to_production
+kind: pipeline
+
+steps:
+
+# Deploy production
+- name: set production environment
+  image: registry.nextpertise.tools/nextpertise-proxy/objectiflibre/jinja-init
+  user: 0
+  environment:
+    JINJA_SRC_FILE: 'k8s/template.j2'
+    JINJA_DEST_FILE: '/config/production.yaml'
+    JINJA_VAR_branchtag: ${DRONE_SOURCE_BRANCH/\/#/-}
+    JINJA_VAR_commithash: ${DRONE_COMMIT_SHA:0:8}
+    JINJA_VAR_harborsecret:
+      from_secret: rke_harbor_token
+    JINJA_VAR_imagetag: ${DRONE_COMMIT_SHA:0:8}
+    JINJA_VAR_namespace: public-ip-lists
+    JINJA_VAR_ingressurl: public-ip-lists.nextpertise.nl
+  volumes:
+  - name: configs
+    path: /config
+  commands:
+  - python /run.py
+  - cat /config/production.yaml
+
+- name: deploy to production
+  image: registry.nextpertise.tools/nextpertise-proxy/sinlead/drone-kubectl
+  depends_on:
+    - set production environment
+  volumes:
+  - name: configs
+    path: /config
+  settings:
+    kubernetes_server:
+      from_secret: rke_prod_server
+    kubernetes_cert:
+      from_secret: rke_prod_cert
+    kubernetes_token:
+      from_secret: rke_prod_token
+  commands:
+    - kubectl --insecure-skip-tls-verify=true apply -f /config/production.yaml
+
+trigger:
+  event:
+  - promote
+  target:
+  - production
+  branch:
+  - main
+  - master
+
+depends_on:
+- docker_image_building
+
+volumes:
+- name: configs
+  temp: {}
+
+image_pull_secrets:
+  - platform_harbor_pull_secrets
+
+---
+name: deployed_non-master_to_production
+kind: pipeline
+
+steps:
+
+# Fail when non-master branch is promoted
+- name: You promoted a non-master branch
+  image: registry.nextpertise.tools/nextpertise-proxy/library/alpine
+  commands:
+  - echo "You can only promote the master branch to production."
+  - exit 1 # force failure
+
+trigger:
+  event:
+  - promote
+  target:
+  - production
+  branch:
+    exclude:
+    - main
+    - master
+
+image_pull_secrets:
+  - platform_harbor_pull_secrets
+
+---
+name: rollback_production
+kind: pipeline
+
+steps:
+
+# Rollback production
+- name: set previous production environment
+  image: registry.nextpertise.tools/nextpertise-proxy/objectiflibre/jinja-init
+  user: 0
+  environment:
+    JINJA_SRC_FILE: 'k8s/template.j2'
+    JINJA_DEST_FILE: '/config/production.yaml'
+    JINJA_VAR_branchtag: ${DRONE_SOURCE_BRANCH/\/#/-}
+    JINJA_VAR_commithash: ${DRONE_COMMIT_SHA:0:8}
+    JINJA_VAR_harborsecret:
+      from_secret: rke_harbor_token
+    JINJA_VAR_namespace: public-ip-lists
+    JINJA_VAR_ingressurl: sshpublickeys.nextpertise.nl
+  volumes:
+  - name: configs
+    path: /config
+  commands:
+  - echo "Rolling back to previous commit:"
+  - git show $(git rev-parse HEAD~1) | head -n 5
+  - export JINJA_VAR_imagetag=$(git rev-parse HEAD~1 | cut -c1-8)
+  - python /run.py
+  - cat /config/production.yaml
+
+- name: rollback production
+  image: registry.nextpertise.tools/nextpertise-proxy/sinlead/drone-kubectl
+  depends_on:
+    - set previous production environment
+  volumes:
+  - name: configs
+    path: /config
+  settings:
+    kubernetes_server:
+      from_secret: rke_prod_server
+    kubernetes_cert:
+      from_secret: rke_prod_cert
+    kubernetes_token:
+      from_secret: rke_prod_token
+  commands:
+    - kubectl --insecure-skip-tls-verify=true apply -f /config/production.yaml
+
+trigger:
+  event:
+  - rollback
+  target:
+  - production
+  branch:
+  - main
+  - master
+
+volumes:
+- name: configs
+  temp: {}
+
+image_pull_secrets:
+  - platform_harbor_pull_secrets
